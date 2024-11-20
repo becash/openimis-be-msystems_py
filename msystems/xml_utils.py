@@ -1,4 +1,3 @@
-import logging
 import re
 import datetime as py_datetime
 
@@ -8,18 +7,12 @@ from lxml import etree
 from core import datetime
 from msystems.apps import MsystemsConfig
 
-logger = logging.getLogger(__name__)
-
 ns_envelope = "http://schemas.xmlsoap.org/soap/envelope/"
 ns_wss_util = "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd"
 ns_wss_s = "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd"
 
 created_xpath = f"./{{{ns_envelope}}}Header/{{{ns_wss_s}}}Security/{{{ns_wss_util}}}Timestamp/{{{ns_wss_util}}}Created"
 expires_xpath = f"./{{{ns_envelope}}}Header/{{{ns_wss_s}}}Security/{{{ns_wss_util}}}Timestamp/{{{ns_wss_util}}}Expires"
-
-# Amount of time allowed over the limit for timestamp checks
-# Without it the check can fail when the client and server time doesn't align
-allowed_dt_delta = datetime.datetimedelta(seconds=1)
 
 
 def add_signature(root, key, cert):
@@ -68,9 +61,7 @@ def verify_timestamp(root):
         raise ValueError('Expires timestamp not found')
     dt_expires = datetime.datetime.fromisoformat(replace_utc_timezone_with_offset(expires.text))
 
-    if dt_created - allowed_dt_delta > dt_now:
-        logger.debug("Created timestamp is in the future: dt_created=%s dt_now=%s", dt_created, dt_now)
+    if dt_created > dt_now:
         raise ValueError('Created timestamp is in the future')
-    if dt_expires + allowed_dt_delta < dt_now:
-        logger.debug("Envelope has expired: dt_expires=%s dt_now=%s", dt_expires, dt_now)
+    if dt_expires < dt_now:
         raise ValueError('Envelope has expired')
