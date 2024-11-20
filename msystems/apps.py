@@ -15,6 +15,7 @@ DEFAULT_CFG = {
         "mpass_key_dob": "BirthDate",
         "mpass_key_roles": "Role",
         "mpass_key_legal_entities": "OrganizationAdministrator",
+        "mpass_key_additional_legal_entity": "AdministeredEntities",
         # "mpass_key_legal_entities": "AdministeredLegalEntity",
 
 

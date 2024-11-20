@@ -78,6 +78,9 @@ class MpassUserService:
             self._update_user_name(user.i_user, data_first_name, data_last_name)
 
     def _update_user_legal_entities(self, user: User, user_data: dict) -> None:
+        if MsystemsConfig.mpass_config["mpass_key_additional_legal_entity"] in user_data:
+            user_data[MsystemsConfig.mpass_config["mpass_key_legal_entities"]] \
+                = user_data[MsystemsConfig.mpass_config["mpass_key_additional_legal_entity"]]
         legal_entities = self._parse_legal_entities(user_data.get(MsystemsConfig.mpass_config["mpass_key_legal_entities"], []))
         policyholders = [self._get_or_create_policy_holder(user, line[1], line[0]) for line in legal_entities]
 
