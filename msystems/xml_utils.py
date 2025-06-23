@@ -61,7 +61,7 @@ def verify_timestamp(root):
         raise ValueError('Expires timestamp not found')
     dt_expires = datetime.datetime.fromisoformat(replace_utc_timezone_with_offset(expires.text))
 
-    if dt_created > dt_now:
+    if abs((dt_created - dt_now).seconds) > 30:
         raise ValueError('Created timestamp is in the future')
     if dt_expires < dt_now:
         raise ValueError('Envelope has expired')
