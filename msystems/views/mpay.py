@@ -116,6 +116,9 @@ def _add_envelope_header(ctx):
     add_signature(root, MsystemsConfig.mpay_config['service_private_key'],
                   MsystemsConfig.mpay_config['service_certificate'])
 
+    body = ctx.out_document.find('{http://schemas.xmlsoap.org/soap/envelope/}Body')
+    ctx.out_document.remove(body)
+    ctx.out_document.append(body)
     envelope = etree.tostring(ctx.out_document, pretty_print=True)
     logger.info(envelope.decode('utf-8'))
     ctx.out_string = [envelope]
