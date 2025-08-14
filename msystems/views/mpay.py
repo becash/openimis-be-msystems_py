@@ -36,7 +36,8 @@ from msystems.xml_utils import add_signature, verify_signature, verify_timestamp
     ns_envelope
 from policyholder.models import PolicyHolder
 from worker_voucher.models import WorkerVoucher
-from worker_voucher.services import worker_voucher_bill_user_filter
+from worker_voucher.services import worker_voucher_bill_user_filter, economic_unit_user_filter
+from django.db.models import Q
 
 namespace = 'https://mpay.gov.md'
 logger = logging.getLogger(__name__)
@@ -407,14 +408,19 @@ class MpayService(ServiceBase):
         _check_amount_due(bill, decimal.Decimal(confirmation.TotalAmount))
         _check_due_date(bill)
 
+        # Get all unpaid vouchers for the specified month (status AWAITING_PAYMENT)
+        unpaid_vouchers = WorkerVoucher.objects.filter(
+            Q(policyholder__code=bill.subject.code) &
+            Q(status=WorkerVoucher.Status.AWAITING_PAYMENT) &
+            Q(assigned_date__year=bill.year) &
+            Q(assigned_date__month=bill.month)
+        ).filter(
+            is_deleted=False,
+        )
+
         with transaction.atomic():
-            for bill_item in bill.line_items_bill.filter(is_deleted=False):
-                voucher = _get_voucher(bill_item)
-                if voucher.status == WorkerVoucher.Status.AWAITING_PAYMENT:
-                    if voucher.insuree is not None:
-                        voucher.status = WorkerVoucher.Status.ASSIGNED
-                    else:
-                        voucher.status = WorkerVoucher.Status.UNASSIGNED
+            for voucher in unpaid_vouchers:
+                    voucher.status = WorkerVoucher.Status.ASSIGNED
                     voucher.save(username=voucher.user_updated.username)
 
             if bill.status != Bill.Status.PAID:
