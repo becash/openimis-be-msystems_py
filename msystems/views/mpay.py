@@ -1,5 +1,9 @@
 import decimal
 import logging
+import uuid
+from base64 import b64encode
+import base64
+from xml.sax.saxutils import escape
 
 from lxml import etree
 from django.db import transaction
@@ -15,6 +19,11 @@ from spyne.server.django import DjangoApplication
 from spyne.service import ServiceBase
 from urllib.parse import urljoin
 from zeep.exceptions import SignatureVerificationFailed
+from cryptography.hazmat.primitives import serialization, hashes
+from cryptography.hazmat.primitives.asymmetric import padding
+from cryptography import x509
+from cryptography.hazmat.backends import default_backend
+import hashlib
 
 from core import datetime
 from invoice.apps import InvoiceConfig
@@ -23,7 +32,8 @@ from msystems.apps import MsystemsConfig
 from msystems.soap.datetime import SoapDatetime
 from msystems.soap.models import OrderDetailsQuery, GetOrderDetailsResult, OrderLine, OrderDetails, \
     PaymentConfirmation, PaymentAccount, OrderStatus, CustomerType
-from msystems.xml_utils import add_signature, verify_signature, verify_timestamp, add_timestamp
+from msystems.xml_utils import add_signature, verify_signature, verify_timestamp, add_timestamp, ns_wss_util, ns_wss_s, \
+    ns_envelope
 from policyholder.models import PolicyHolder
 from worker_voucher.models import WorkerVoucher
 from worker_voucher.services import worker_voucher_bill_user_filter
@@ -109,16 +119,234 @@ def _validate_envelope(ctx):
         raise Fault(faultcode='InvalidRequest', faultstring='Envelope signature verification failed')
 
 
+def _canonicalize_element(element):
+    """Canonicalize element using C14N exclusive canonicalization"""
+    return etree.tostring(element, method="c14n", exclusive=True, with_comments=False)
+
+
+def _create_digest(element):
+    """Create SHA-1 digest of canonicalized element"""
+    canonical_xml = _canonicalize_element(element)
+    digest = hashlib.sha1(canonical_xml).digest()
+    return base64.b64encode(digest).decode('utf-8')
+
+
+def _create_signed_info(body_id, timestamp_id=None):
+    """Create SignedInfo element for WS-Security signature"""
+    signed_info = etree.Element(etree.QName("http://www.w3.org/2000/09/xmldsig#", "SignedInfo"))
+
+    # CanonicalizationMethod
+    canonicalization_method = etree.SubElement(
+        signed_info,
+        etree.QName("http://www.w3.org/2000/09/xmldsig#", "CanonicalizationMethod")
+    )
+    canonicalization_method.set("Algorithm", "http://www.w3.org/2001/10/xml-exc-c14n#")
+
+    # SignatureMethod
+    signature_method = etree.SubElement(
+        signed_info,
+        etree.QName("http://www.w3.org/2000/09/xmldsig#", "SignatureMethod")
+    )
+    signature_method.set("Algorithm", "http://www.w3.org/2000/09/xmldsig#rsa-sha1")
+
+    return signed_info
+
+
+def _add_reference(signed_info, element_id, digest_value):
+    """Add Reference element to SignedInfo"""
+    reference = etree.SubElement(
+        signed_info,
+        etree.QName("http://www.w3.org/2000/09/xmldsig#", "Reference")
+    )
+    reference.set("URI", f"#{element_id}")
+
+    # Transforms
+    transforms = etree.SubElement(
+        reference,
+        etree.QName("http://www.w3.org/2000/09/xmldsig#", "Transforms")
+    )
+    transform = etree.SubElement(
+        transforms,
+        etree.QName("http://www.w3.org/2000/09/xmldsig#", "Transform")
+    )
+    transform.set("Algorithm", "http://www.w3.org/2001/10/xml-exc-c14n#")
+
+    # DigestMethod
+    digest_method = etree.SubElement(
+        reference,
+        etree.QName("http://www.w3.org/2000/09/xmldsig#", "DigestMethod")
+    )
+    digest_method.set("Algorithm", "http://www.w3.org/2000/09/xmldsig#sha1")
+
+    # DigestValue
+    digest_value_elem = etree.SubElement(
+        reference,
+        etree.QName("http://www.w3.org/2000/09/xmldsig#", "DigestValue")
+    )
+    digest_value_elem.text = digest_value
+
+    return reference
+
+
+def _sign_signed_info(signed_info, private_key):
+    """Sign the SignedInfo using RSA-SHA1"""
+    # Canonicalize SignedInfo
+    canonical_signed_info = _canonicalize_element(signed_info)
+
+    # Parse private key if it's a string
+    if isinstance(private_key, str):
+        private_key_obj = serialization.load_pem_private_key(
+            private_key.encode('utf-8'),
+            password=None,
+            backend=default_backend()
+        )
+    else:
+        private_key_obj = private_key
+
+    # Sign using PKCS1v15 with SHA1
+    signature = private_key_obj.sign(
+        canonical_signed_info,
+        padding.PKCS1v15(),
+        hashes.SHA1()
+    )
+
+    return base64.b64encode(signature).decode('utf-8')
+
+
+def add_ws_security_signature(root, private_key, certificate, cert_id="X509Token"):
+    """
+    Add WS-Security signature with SecurityTokenReference according to IBM WebSphere standards
+    """
+    # Find or create Security header
+    security = root.find(f".//{{{ns_wss_s}}}Security")
+    if security is None:
+        header = root.find(f".//{{{ns_envelope}}}Header")
+        if header is None:
+            header = etree.SubElement(root, etree.QName(ns_envelope, "Header"))
+        security = etree.SubElement(header, etree.QName(ns_wss_s, "Security"))
+
+    # Add BinarySecurityToken if not present
+    binary_token = security.find(f".//{{{ns_wss_s}}}BinarySecurityToken")
+    if binary_token is None:
+        # Parse certificate to get DER data
+        if isinstance(certificate, str):
+            cert_obj = x509.load_pem_x509_certificate(
+                certificate.encode('utf-8'),
+                default_backend()
+            )
+            cert_der = cert_obj.public_bytes(serialization.Encoding.DER)
+        else:
+            cert_der = certificate
+
+        b64_cert = base64.b64encode(cert_der).decode('utf-8')
+
+        binary_token = etree.SubElement(security, etree.QName(ns_wss_s, "BinarySecurityToken"))
+        binary_token.set("EncodingType",
+                         "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-soap-message-security-1.0#Base64Binary")
+        binary_token.set("ValueType",
+                         "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-x509-token-profile-1.0#X509v3")
+        binary_token.set(etree.QName(ns_wss_util, "Id"), cert_id)
+        binary_token.text = b64_cert
+
+    # Get elements to sign
+    body = root.find(f".//{{{ns_envelope}}}Body")
+    timestamp = security.find(f".//{{{ns_wss_util}}}Timestamp")
+
+    if body is None:
+        return
+
+    # Add IDs if missing
+    body_id = body.get(etree.QName(ns_wss_util, "Id"))
+    if not body_id:
+        body_id = f"Body-{uuid.uuid4().hex[:8]}"
+        body.set(etree.QName(ns_wss_util, "Id"), body_id)
+
+    timestamp_id = None
+    if timestamp is not None:
+        timestamp_id = timestamp.get(etree.QName(ns_wss_util, "Id"))
+        if not timestamp_id:
+            timestamp_id = f"Timestamp-{uuid.uuid4().hex[:8]}"
+            timestamp.set(etree.QName(ns_wss_util, "Id"), timestamp_id)
+
+    # Create Signature element
+    signature = etree.SubElement(security, etree.QName("http://www.w3.org/2000/09/xmldsig#", "Signature"))
+
+    # Create SignedInfo
+    signed_info = _create_signed_info(body_id, timestamp_id)
+    signature.append(signed_info)
+
+    # Add reference to Body
+    body_digest = _create_digest(body)
+    _add_reference(signed_info, body_id, body_digest)
+
+    # Add reference to Timestamp if present
+    if timestamp is not None and timestamp_id:
+        timestamp_digest = _create_digest(timestamp)
+        _add_reference(signed_info, timestamp_id, timestamp_digest)
+
+    # Sign the SignedInfo
+    signature_value = _sign_signed_info(signed_info, private_key)
+
+    # Add SignatureValue
+    signature_value_elem = etree.SubElement(
+        signature,
+        etree.QName("http://www.w3.org/2000/09/xmldsig#", "SignatureValue")
+    )
+    signature_value_elem.text = signature_value
+
+    # Add KeyInfo with SecurityTokenReference
+    key_info = etree.SubElement(
+        signature,
+        etree.QName("http://www.w3.org/2000/09/xmldsig#", "KeyInfo")
+    )
+
+    security_token_ref = etree.SubElement(
+        key_info,
+        etree.QName(ns_wss_s, "SecurityTokenReference")
+    )
+
+    # Reference to BinarySecurityToken
+    wsse_reference = etree.SubElement(
+        security_token_ref,
+        etree.QName(ns_wss_s, "Reference")
+    )
+    wsse_reference.set("URI", f"#{cert_id}")
+    wsse_reference.set("ValueType",
+                       "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-x509-token-profile-1.0#X509v3")
+
+    # Ensure proper ordering: Timestamp, BinarySecurityToken, Signature
+    timestamp = security.find(f".//{{{ns_wss_util}}}Timestamp")
+    binary_token = security.find(f".//{{{ns_wss_s}}}BinarySecurityToken")
+
+    if timestamp is not None:
+        security.remove(timestamp)
+        security.insert(0, timestamp)
+
+    if binary_token is not None:
+        security.remove(binary_token)
+        if timestamp is not None:
+            security.insert(1, binary_token)
+        else:
+            security.insert(0, binary_token)
+
+    signature = security.find(f".//{{'http://www.w3.org/2000/09/xmldsig#'}}Signature")
+    if signature is not None:
+        security.remove(signature)
+        security.append(signature)
+
+
 def _add_envelope_header(ctx):
     root = ctx.out_document
 
     add_timestamp(root)
-    add_signature(root, MsystemsConfig.mpay_config['service_private_key'],
-                  MsystemsConfig.mpay_config['service_certificate'])
 
-    body = ctx.out_document.find('{http://schemas.xmlsoap.org/soap/envelope/}Body')
-    ctx.out_document.remove(body)
-    ctx.out_document.append(body)
+    # Add WS-Security signature according to IBM WebSphere standards
+    add_ws_security_signature(
+        root,
+        MsystemsConfig.mpay_config['service_private_key'],
+        MsystemsConfig.mpay_config['service_certificate']
+    )
+
     envelope = etree.tostring(ctx.out_document, pretty_print=True)
     logger.info(envelope.decode('utf-8'))
     ctx.out_string = [envelope]
