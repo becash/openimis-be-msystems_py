@@ -1,5 +1,6 @@
 import re
 import datetime as py_datetime
+import uuid
 
 from zeep.wsse.signature import _make_sign_key, _sign_envelope_with_key, _make_verify_key, _verify_envelope_with_key
 from lxml import etree
@@ -33,6 +34,8 @@ def add_timestamp(root):
     dt_expires = dt_now + datetime.datetimedelta(minutes=5)
 
     header = etree.SubElement(root, etree.QName(ns_envelope, "Header"))
+    root.insert(0, header)
+
     security = etree.SubElement(header, etree.QName(ns_wss_s, "Security"))
     timestamp = etree.SubElement(security, etree.QName(ns_wss_util, "Timestamp"))
     created = etree.SubElement(timestamp, etree.QName(ns_wss_util, "Created"))
