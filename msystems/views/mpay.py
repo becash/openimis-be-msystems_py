@@ -413,14 +413,15 @@ class MpayService(ServiceBase):
             Q(policyholder__code=bill.subject.code) &
             Q(status=WorkerVoucher.Status.AWAITING_PAYMENT) &
             Q(assigned_date__year=bill.year) &
-            Q(assigned_date__month=bill.month)
+            Q(assigned_date__month=bill.month) &
+            Q(bill_code=None)
         ).filter(
             is_deleted=False,
         )
 
         with transaction.atomic():
             for voucher in unpaid_vouchers:
-                    voucher.status = WorkerVoucher.Status.ASSIGNED
+                    voucher.bill_code = bill.code
                     voucher.save(username=voucher.user_updated.username)
 
             if bill.status != Bill.Status.PAID:
